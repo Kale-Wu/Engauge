@@ -22,8 +22,8 @@ ENGAGEMENT_MIN_DURATION = 3  # seconds required to exit boredom
 APPS = [
     {"name": "youtube", "url": "https://www.youtube.com/shorts"},
     {"name": "instagram", "url": "https://www.instagram.com/reels/"},
-    {"name": "tiktok", "url": "https://www.tiktok.com/@for_you"},
-    {"name": "linkedin", "url": "https://www.linkedin.com/feed/"},
+    {"name": "tiktok", "url": "https://www.tiktok.com/@mythosmondays/video/7606796928923225366"},
+    # {"name": "linkedin", "url": "https://www.linkedin.com/feed/"},
 ]
 
 NUM_APPS = len(APPS)
