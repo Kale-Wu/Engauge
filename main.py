@@ -1,282 +1,274 @@
+"""
+Watches the webcam for signs of boredom using facial emotion analysis.
+When boredom is detected and sustained, launches social media apps
+tiled side-by-side. Closes them once engagement returns.
+"""
+
 import cv2
 from deepface import DeepFace
 from collections import deque
 import time
 import threading
 import subprocess
-import signal
 import os
 import tempfile
 import shutil
 
-# Constants
-ENTER_THRESHOLD = 0.45   # must exceed this to trigger boredom
-EXIT_THRESHOLD = 0.20    # must be below this to trigger interest 
-WINDOW = 4  # frames (~0.5s at 30fps)
-FPS = 30
-WEIGHT_DECAY = 1.2  # exponential weight factor (higher = more weight to recent frames)
-BOREDOM_MIN_DURATION = 5  # seconds required to trigger boredom
-ENGAGEMENT_MIN_DURATION = 3  # seconds required to exit boredom
+# Two separate thresholds prevent flickering at the boundary — the score
+# has to rise high to trigger boredom, but fall much lower to exit it.
+ENTER_THRESHOLD = 0.45          # Score must exceed this to start boredom timer
+EXIT_THRESHOLD = 0.20           # Score must fall below this to start recovery timer
+BOREDOM_MIN_DURATION = 5        # Seconds above threshold before opening apps
+ENGAGEMENT_MIN_DURATION = 3     # Seconds below threshold before closing apps
 
-# Apps to display (left to right)
+# Raw per-frame scores are noisy, so we average over a short rolling window.
+# WEIGHT_DECAY makes recent frames count more than older ones.
+WINDOW = 4
+WEIGHT_DECAY = 1.2
+
+FPS = 30
+EMOTION_ANALYSIS_INTERVAL = 3   # Only analyze every 3rd frame to reduce lag
+
+# Add or remove apps here. Each gets an equal slice of the screen.
 APPS = [
-    {"name": "youtube", "url": "https://www.youtube.com/shorts"},
+    {"name": "youtube",   "url": "https://www.youtube.com/shorts"},
     {"name": "instagram", "url": "https://www.instagram.com/reels/"},
-    {"name": "tiktok", "url": "https://www.tiktok.com/@mythosmondays/video/7606796928923225366"},
-    # {"name": "linkedin", "url": "https://www.linkedin.com/feed/"},
+    {"name": "tiktok",    "url": "https://www.tiktok.com/@mythosmondays/video/7606796928923225366"},
 ]
 
 NUM_APPS = len(APPS)
-APP_WIDTH_FRACTION = 1.0 / NUM_APPS  # Each app gets equal width
 
-# Initialize video capture (0 is the default webcam)
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FPS, FPS)
-
-# Calculate delay in milliseconds for the FPS rate
 frame_delay = int(1000 / FPS)
 
-# Check if the camera is opened successfully
 if not cap.isOpened():
     print("Error: Could not open video feed")
     exit()
 
 print("Video feed started. Press 'q' to quit.")
 
-# Engagement state tracking (starts as engaged)
+# Current state of the user, and timers for how long they've been in that state.
 engagement_state = "Engaged"
-previous_engagement_state = "Engaged"  # Track previous state for transitions
-
-# Browser process management
-app_processes = {}  # {app_name: subprocess.Popen}
-app_user_dirs = {}  # {app_name: temp_dir_path}
-app_management_active = True
-app_management_lock = threading.Lock()
-
-# Duration tracking for state transitions
-frames_above_threshold = 0  # frames boredom score has been above ENTER_THRESHOLD
-frames_below_threshold = 0  # frames boredom score has been below EXIT_THRESHOLD
-bored_start_time = None  # timestamp when score exceeded ENTER_THRESHOLD
-engaged_start_time = None  # timestamp when score fell below EXIT_THRESHOLD
-
-# Frame counter for skipping analysis
-frame_count = 0
-
-# Rolling window for smoothing boredom score
+bored_start_time = None
+engaged_start_time = None
 history = deque(maxlen=WINDOW)
 
-# App management functions using subprocess
-def open_single_app(app):
-    """Open a single app in its own browser process."""
+# Tracks open browser processes and their temp profile directories.
+# The lock prevents open/close calls from colliding across threads.
+app_processes = {}
+app_user_dirs = {}
+app_management_lock = threading.Lock()
+
+
+def find_chrome_path():
+    """Check common install locations and return the first Chrome/Edge found."""
+    candidates = [
+        "C:/Program Files/Google/Chrome/Application/chrome.exe",
+        "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+        "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise RuntimeError("Chrome or Edge not found. Please install Google Chrome.")
+
+
+def get_app_window_geometry(app_index):
+    """Calculate position and size so all apps tile evenly across the screen."""
     import ctypes
     user32 = ctypes.windll.user32
     screen_width = user32.GetSystemMetrics(0)
     screen_height = user32.GetSystemMetrics(1)
-    
-    app_index = APPS.index(app)
-    app_width = int(screen_width / NUM_APPS)
+
+    app_width = screen_width // NUM_APPS
     app_x = app_width * app_index
-    
-    chrome_path = "C:/Program Files/Google/Chrome/Application/chrome.exe"
-    
-    # Check if Chrome exists, otherwise try Chromium or Edge
-    if not os.path.exists(chrome_path):
-        chrome_path = "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"
-    if not os.path.exists(chrome_path):
-        chrome_path = "C:/Program Files/Microsoft/Edge/Application/msedge.exe"
-    
-    try:
-        with app_management_lock:
-            # Don't open if already open
-            if app["name"] in app_processes:
-                return
-            
-            # Create isolated user-data-dir for this app instance
-            user_dir = tempfile.mkdtemp(prefix=f"chrome_{app['name']}_")
-            app_user_dirs[app["name"]] = user_dir
-            
-            proc = subprocess.Popen([
-                chrome_path,
-                f"--app={app['url']}",
-                f"--window-position={app_x},0",
-                f"--window-size={app_width},{screen_height}",
-                f"--user-data-dir={user_dir}",
-                "--no-first-run",
-                "--disable-extensions",
-                "--incognito",
-            ])
-            app_processes[app["name"]] = proc
-            print(f"Opened {app['name']} at x={app_x}, size={app_width}x{screen_height}. PID: {proc.pid}")
-    except Exception as e:
-        print(f"Error opening {app['name']}: {e}")
+
+    return (app_x, 0, app_width, screen_height)
+
+
+def open_single_app(app):
+    """Launch a Chrome window for one app with its own isolated profile."""
+    app_index = APPS.index(app)
+    app_x, _, app_width, app_height = get_app_window_geometry(app_index)
+    chrome_path = find_chrome_path()
+
+    with app_management_lock:
+        if app["name"] in app_processes:
+            return
+
+        # Each app gets a throwaway temp profile so they don't share sessions.
+        user_dir = tempfile.mkdtemp(prefix=f"chrome_{app['name']}_")
+        app_user_dirs[app["name"]] = user_dir
+
+        proc = subprocess.Popen([
+            chrome_path,
+            f"--app={app['url']}",
+            f"--window-position={app_x},0",
+            f"--window-size={app_width},{app_height}",
+            f"--user-data-dir={user_dir}",
+            "--no-first-run",
+            "--disable-extensions",
+            "--incognito",
+        ])
+        app_processes[app["name"]] = proc
+        print(f"[+] {app['name']:12} PID {proc.pid:5} | x={app_x}, size={app_width}x{app_height}")
+
 
 def close_single_app(app_name):
-    """Close a single app's browser process and clean up temp profile."""
+    """Kill a Chrome window and delete its temp profile."""
     with app_management_lock:
         proc = app_processes.pop(app_name, None)
         user_dir = app_user_dirs.pop(app_name, None)
-    
+
     if proc:
         try:
-            print(f"Killing process tree for {app_name} (PID: {proc.pid})...")
-            # Use taskkill to kill entire process tree (/T flag)
+            # Chrome spawns multiple child processes, so we kill the whole tree.
+            # /F = force kill, /T = include all children of this PID.
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True
+                capture_output=True,
+                timeout=5
             )
-            print(f"Killed {app_name}")
+            print(f"[-] {app_name:12} PID {proc.pid:5} | Killed")
         except Exception as e:
-            print(f"Error closing {app_name}: {e}")
-    else:
-        print(f"{app_name} not found in active processes")
-    
-    # Clean up temp profile directory
+            print(f"[!] {app_name:12} | Error closing: {e}")
+
     if user_dir and os.path.exists(user_dir):
-        try:
-            shutil.rmtree(user_dir, ignore_errors=True)
-            print(f"Cleaned up profile for {app_name}")
-        except Exception as e:
-            print(f"Error cleaning up profile for {app_name}: {e}")
+        shutil.rmtree(user_dir, ignore_errors=True)
+
 
 def open_all_apps():
-    """Open all apps."""
     for app in APPS:
         if app["name"] not in app_processes:
             open_single_app(app)
 
+
 def close_all_apps():
-    """Close all active app browsers."""
-    # Extract list of app names while holding lock, then release lock before closing
     with app_management_lock:
         app_names_to_close = list(app_processes.keys())
-    
-    # Close each app outside the lock to avoid deadlock
-    for app_name in app_names_to_close:
-        close_single_app(app_name)
+    threads = [threading.Thread(target=close_single_app, args=(name,), daemon=False) for name in app_names_to_close]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
 
 def open_apps_threaded():
-    """Request to open all apps in background thread."""
-    thread = threading.Thread(target=open_all_apps, daemon=True)
-    thread.start()
+    threading.Thread(target=open_all_apps, daemon=True).start()
+
 
 def close_apps_threaded(wait=False):
-    """Request to close all apps in background thread."""
-    thread = threading.Thread(target=close_all_apps, daemon=False)
-    thread.start()
+    t = threading.Thread(target=close_all_apps, daemon=False)
+    t.start()
     if wait:
-        thread.join(timeout=10)  # Wait up to 10 seconds for closure
+        t.join(timeout=10)
 
-# Main loop for video processing
+
+def analyze_frame_emotions(frame):
+    """Run DeepFace on a frame and return the emotion scores, or None on failure."""
+    try:
+        result = DeepFace.analyze(
+            frame,
+            actions=['emotion'],
+            detector_backend="retinaface",
+            enforce_detection=False
+        )
+        return result[0]['emotion'] if result else None
+    except Exception as e:
+        print(f"[!] Emotion analysis failed: {e}")
+        return None
+
+
+def calculate_boredom_score(emotions):
+    """
+    Collapse emotion percentages into a single boredom score between 0 and 1.
+    Neutral is weighted heaviest since it's the most common boredom signal.
+    """
+    if not emotions:
+        return 0.0
+    return ((emotions.get('neutral', 0) * 0.5 +
+             emotions.get('sad', 0) * 0.3 +
+             emotions.get('angry', 0) * 0.1 +
+             emotions.get('disgust', 0) * 0.1) / 100)
+
+
+def update_smoothed_score(raw_score):
+    """Add the latest score to the rolling window and return the weighted average."""
+    history.append(raw_score)
+    weighted_sum = sum(score * (WEIGHT_DECAY ** i) for i, score in enumerate(history))
+    weight_total = sum(WEIGHT_DECAY ** i for i in range(len(history)))
+    return weighted_sum / weight_total
+
+
+def update_engagement_state(smoothed_score):
+    """
+    Transition between Engaged and Bored based on how long the score stays
+    above or below its respective threshold. The gap between ENTER_THRESHOLD
+    and EXIT_THRESHOLD prevents rapid back-and-forth at the boundary.
+    """
+    global engagement_state, bored_start_time, engaged_start_time
+
+    previous_state = engagement_state
+
+    if engagement_state == "Engaged":
+        if smoothed_score > ENTER_THRESHOLD:
+            if bored_start_time is None:
+                bored_start_time = time.time()
+            elapsed = time.time() - bored_start_time
+            if elapsed >= BOREDOM_MIN_DURATION:
+                engagement_state = "Bored"
+                bored_start_time = None
+                if previous_state != "Bored":
+                    open_apps_threaded()
+            print(f"[→] Score: {smoothed_score:.2f} | Boredom: {elapsed:.1f}s/{BOREDOM_MIN_DURATION}s | State: {engagement_state}")
+        else:
+            bored_start_time = None
+            print(f"[→] Score: {smoothed_score:.2f} | State: {engagement_state}")
+
+    elif engagement_state == "Bored":
+        if smoothed_score < EXIT_THRESHOLD:
+            if engaged_start_time is None:
+                engaged_start_time = time.time()
+            elapsed = time.time() - engaged_start_time
+            if elapsed >= ENGAGEMENT_MIN_DURATION:
+                engagement_state = "Engaged"
+                engaged_start_time = None
+                if previous_state != "Engaged":
+                    close_apps_threaded()
+            print(f"[←] Score: {smoothed_score:.2f} | Recovery: {elapsed:.1f}s/{ENGAGEMENT_MIN_DURATION}s | State: {engagement_state}")
+        else:
+            engaged_start_time = None
+            print(f"[←] Score: {smoothed_score:.2f} | State: {engagement_state}")
+
+
+frame_count = 0
+
 try:
     while True:
-        # Read frame from the video feed
         ret, frame = cap.read()
-        
         if not ret:
             print("Error: Failed to read frame")
             break
-        
-        # Analyze emotions using DeepFace
+
         frame_count += 1
-        if frame_count % 3 == 0:
-            try:
-                result = DeepFace.analyze(
-                    frame, 
-                    actions=['emotion'],
-                    detector_backend="retinaface",  # More accurate face detection
-                    enforce_detection=False
-                    )
-                
-                # Get the dominant emotion and all emotion scores from the result
-                if result and len(result) > 0:
-                    dominant_emotion = result[0]['dominant_emotion']
-                    emotions = result[0]['emotion']
-                    
-                    # Extract emotion values (default to 0 if not present)
-                    neutral = emotions.get('neutral', 0)
-                    sad = emotions.get('sad', 0)
-                    angry = emotions.get('angry', 0)
-                    disgust = emotions.get('disgust', 0)
-                    
-                    # Calculate boredom score (normalized to 0-1)
-                    boredom_score = ((neutral * 0.5) + (sad * 0.3) + (angry * 0.1) + (disgust * 0.1)) / 100
-                    
-                    # Add to rolling window and calculate weighted smoothed score
-                    history.append(boredom_score)
-                    
-                    # Calculate weighted average (more recent frames get higher weights)
-                    weighted_sum = 0
-                    weight_total = 0
-                    for i, score in enumerate(history):
-                        # Weight increases exponentially towards the end (most recent)
-                        weight = WEIGHT_DECAY ** i
-                        weighted_sum += score * weight
-                        weight_total += weight
-                    
-                    smoothed_score = weighted_sum / weight_total
-                    
-                    # Track state transitions
-                    previous_engagement_state = engagement_state
-                    # Duration-based state machine logic for engagement
-                    if engagement_state == "Engaged":
-                        if smoothed_score > ENTER_THRESHOLD:
-                            # Track when threshold is first exceeded
-                            if bored_start_time is None:
-                                bored_start_time = time.time()
-                            
-                            elapsed = time.time() - bored_start_time
-                            # Transition to bored if sustained for minimum duration
-                            if elapsed >= BOREDOM_MIN_DURATION:
-                                engagement_state = "Bored"
-                                bored_start_time = None
-                                # Transition to bored - open apps
-                                if previous_engagement_state != "Bored":
-                                    open_apps_threaded()
-                            print(f"Boredom Score: {smoothed_score:.2f} | Duration above threshold: {elapsed:.1f}s/{BOREDOM_MIN_DURATION}s | Status: {engagement_state}")
-                        else:
-                            bored_start_time = None
-                            print(f"Boredom Score: {smoothed_score:.2f} | Status: {engagement_state}")
-                    elif engagement_state == "Bored":
-                        if smoothed_score < EXIT_THRESHOLD:
-                            # Track when threshold is first fallen below
-                            if engaged_start_time is None:
-                                engaged_start_time = time.time()
-                            
-                            elapsed = time.time() - engaged_start_time
-                            # Transition to engaged if sustained for minimum duration
-                            if elapsed >= ENGAGEMENT_MIN_DURATION:
-                                engagement_state = "Engaged"
-                                engaged_start_time = None
-                                # Transition to engaged - close apps
-                                if previous_engagement_state != "Engaged":
-                                    close_apps_threaded()
-                            print(f"Boredom Score: {smoothed_score:.2f} | Duration below threshold: {elapsed:.1f}s/{ENGAGEMENT_MIN_DURATION}s | Status: {engagement_state}")
-                        else:
-                            engaged_start_time = None
-                            print(f"Boredom Score: {smoothed_score:.2f} | Status: {engagement_state}")
-            except Exception as e:
-                print(f"Error analyzing emotion: {e}")
-        
-        # Display the frame in a window
+        if frame_count % EMOTION_ANALYSIS_INTERVAL == 0:
+            emotions = analyze_frame_emotions(frame)
+            if emotions:
+                raw_score = calculate_boredom_score(emotions)
+                smoothed_score = update_smoothed_score(raw_score)
+                update_engagement_state(smoothed_score)
+
         cv2.imshow('Video Feed', frame)
-        
-        # Press 'q' to exit the loop
+
         if cv2.waitKey(frame_delay) & 0xFF == ord('q'):
             break
 
 except KeyboardInterrupt:
-    print("\nProgram interrupted by user (Ctrl+C).")
-    print("Cleaning up...")
+    print("\n[*] Interrupted.")
 
 finally:
-    # Release resources
-    print("Closing video feed...")
     cap.release()
     cv2.destroyAllWindows()
-    
-    # Close all apps
-    print("Closing all app browsers...")
-    close_all_apps()  # Call directly (blocking) instead of threaded
-    time.sleep(1)  # Wait for apps to fully close
-    
-    print("Program ended.")
+    close_all_apps()
+    print("[*] Done.")
